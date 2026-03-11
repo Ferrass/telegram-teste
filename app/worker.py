@@ -23,7 +23,7 @@ from app.metrics_service import run_metrics_collection
 from app.models import PostStatus, ScheduledPost
 from app.post_service import get_pending_posts
 from app.telegram_client import get_client
-
+from telethon.tl.types import PeerChannel
 logging.basicConfig(
     level=settings.log_level,
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
@@ -51,7 +51,10 @@ async def send_post(post: ScheduledPost) -> None:
 
         async with get_client(session_string) as client:
             try:
-                entity = await client.get_entity(post.channel.channel_id)
+                channel_id = post.channel.channel_id
+                if channel_id < 0:
+                    channel_id = int(str(abs(channel_id))[3:])  # remove o -100 do início
+                entity = await client.get_entity(PeerChannel(channel_id))
 
                 if post.media_url:
                     sent = await client.send_file(entity, post.media_url, caption=post.message)
