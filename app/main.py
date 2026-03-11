@@ -390,10 +390,11 @@ async def create_post(
 @app.get("/posts", response_model=list[PostOut], tags=["Posts"])
 async def list_posts(
     status_filter: PostStatus | None = None,
+    phone: str | None = Depends(get_active_phone),
     user: User = Depends(current_user),
     db: AsyncSession = Depends(get_db),
 ):
-    return await get_user_posts(db, user.id, status=status_filter)
+    return await get_user_posts(db, user.id, status=status_filter, phone_number=phone)
 
 
 @app.delete("/posts/{post_id}", status_code=204, tags=["Posts"])
@@ -412,10 +413,11 @@ async def delete_post(
 
 @app.get("/analytics/posts", response_model=list[AnalyticsOut], tags=["Analytics"])
 async def analytics(
+    phone: str | None = Depends(get_active_phone),
     user: User = Depends(current_user),
     db: AsyncSession = Depends(get_db),
 ):
-    posts = await get_user_posts(db, user.id, status=PostStatus.sent)
+    posts = await get_user_posts(db, user.id, status=PostStatus.sent, phone_number=phone)
     return [
         AnalyticsOut(
             post_id=p.id,

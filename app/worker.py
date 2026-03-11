@@ -1,11 +1,12 @@
 """
 Background worker process.
+Suporte a múltiplas contas — usa phone_number do canal para selecionar sessão correta.
 
-Runs two independent loops:
-  • Scheduler  — fires due posts every SCHEDULER_INTERVAL_SECONDS (default 60s)
-  • Metrics    — collects view/forward stats every METRICS_INTERVAL_SECONDS (default 1800s)
+Loops:
+  • Scheduler  — envia posts a cada SCHEDULER_INTERVAL_SECONDS (default 60s)
+  • Metrics    — coleta views/forwards a cada METRICS_INTERVAL_SECONDS (default 1800s)
 
-Start with:
+Start:
     python -m app.worker
 """
 import asyncio
@@ -17,7 +18,7 @@ import boto3
 from sqlalchemy import update
 from telethon.tl.types import PeerChannel
 
-from app.auth_service import get_decrypted_session
+from app.auth_service import get_decrypted_session_by_phone
 from app.config import settings
 from app.database import AsyncSessionLocal, init_db
 from app.metrics_service import run_metrics_collection
@@ -34,10 +35,9 @@ logger = logging.getLogger(__name__)
 _shutdown = asyncio.Event()
 
 
-# ─── R2 helper ────────────────────────────────────────────────────────────────
+# ── R2 helper ─────────────────────────────────────────────────────────────────
 
 def delete_from_r2(media_url: str) -> None:
-    """Remove um arquivo do Cloudflare R2 após o envio."""
     if not settings.r2_endpoint or not media_url:
         return
     try:
@@ -55,14 +55,23 @@ def delete_from_r2(media_url: str) -> None:
         logger.warning("Não foi possível apagar mídia do R2 (%s): %s", media_url, exc)
 
 
-# ─── Send post ────────────────────────────────────────────────────────────────
+# ── Send post ─────────────────────────────────────────────────────────────────
 
 async def send_post(post: ScheduledPost) -> None:
-    """Envia um post agendado via sessão Telethon do dono."""
+    """
+    Envia um post agendado.
+    Usa o phone_number do canal para selecionar a sessão Telegram correta.
+    """
     async with AsyncSessionLocal() as db:
-        session_string = await get_decrypted_session(db, post.user_id)
+        # Pega o phone do canal — suporte a múltiplas contas
+        phone = getattr(post.channel, "phone_number", None)
+
+        session_string = await get_decrypted_session_by_phone(db, post.user_id, phone)
         if not session_string:
-            logger.error("Sem sessão Telegram para user %s — post %s marcado como failed", post.user_id, post.id)
+            logger.error(
+                "Sem sessão Telegram para user=%s phone=%s — post %s marcado como failed",
+                post.user_id, phone, post.id
+            )
             await db.execute(
                 update(ScheduledPost)
                 .where(ScheduledPost.id == post.id)
@@ -73,10 +82,10 @@ async def send_post(post: ScheduledPost) -> None:
 
         async with get_client(session_string) as client:
             try:
-                # Resolve o canal corretamente via PeerChannel
+                # Resolve o canal corretamente
                 channel_id = post.channel.channel_id
                 if channel_id < 0:
-                    channel_id = int(str(abs(channel_id))[3:])  # remove o -100
+                    channel_id = int(str(abs(channel_id))[3:])
 
                 try:
                     if post.channel.username:
@@ -86,7 +95,7 @@ async def send_post(post: ScheduledPost) -> None:
                 except Exception:
                     entity = await client.get_entity(post.channel.channel_id)
 
-                # Envia mensagem ou arquivo
+                # Envia com ou sem mídia
                 if post.media_url:
                     sent = await client.send_file(entity, post.media_url, caption=post.message)
                 else:
@@ -94,19 +103,18 @@ async def send_post(post: ScheduledPost) -> None:
 
                 msg_id = sent.id
 
-                # Atualiza status no banco
                 await db.execute(
                     update(ScheduledPost)
                     .where(ScheduledPost.id == post.id)
-                    .values(
-                        status=PostStatus.sent,
-                        telegram_message_id=msg_id,
-                    )
+                    .values(status=PostStatus.sent, telegram_message_id=msg_id)
                 )
                 await db.commit()
-                logger.info("Post %s enviado para canal %s (msg_id=%s)", post.id, post.channel.channel_id, msg_id)
+                logger.info(
+                    "Post %s enviado — canal=%s phone=%s msg_id=%s",
+                    post.id, post.channel.channel_name, phone, msg_id
+                )
 
-                # Apaga mídia do R2 após envio bem-sucedido
+                # Apaga mídia do R2 após envio
                 if post.media_url:
                     delete_from_r2(post.media_url)
 
@@ -120,10 +128,10 @@ async def send_post(post: ScheduledPost) -> None:
                 await db.commit()
 
 
-# ─── Scheduler loop ───────────────────────────────────────────────────────────
+# ── Scheduler loop ────────────────────────────────────────────────────────────
 
 async def scheduler_loop() -> None:
-    logger.info("Scheduler worker iniciado (intervalo=%ds)", settings.scheduler_interval_seconds)
+    logger.info("Scheduler iniciado (intervalo=%ds)", settings.scheduler_interval_seconds)
     while not _shutdown.is_set():
         try:
             async with AsyncSessionLocal() as db:
@@ -131,7 +139,10 @@ async def scheduler_loop() -> None:
 
             if pending:
                 logger.info("Encontrados %d post(s) para enviar", len(pending))
-                results = await asyncio.gather(*[send_post(p) for p in pending], return_exceptions=True)
+                results = await asyncio.gather(
+                    *[send_post(p) for p in pending],
+                    return_exceptions=True
+                )
                 for r in results:
                     if isinstance(r, Exception):
                         logger.error("Erro ao enviar post: %s", r, exc_info=r)
@@ -147,7 +158,7 @@ async def scheduler_loop() -> None:
             pass
 
 
-# ─── Metrics loop ─────────────────────────────────────────────────────────────
+# ── Metrics loop ──────────────────────────────────────────────────────────────
 
 async def metrics_loop() -> None:
     logger.info("Metrics worker iniciado (intervalo=%ds)", settings.metrics_interval_seconds)
@@ -166,14 +177,14 @@ async def metrics_loop() -> None:
             pass
 
 
-# ─── Graceful shutdown ────────────────────────────────────────────────────────
+# ── Graceful shutdown ─────────────────────────────────────────────────────────
 
 def _handle_signal(sig: signal.Signals) -> None:
-    logger.info("Sinal recebido %s — encerrando...", sig.name)
+    logger.info("Sinal %s recebido — encerrando...", sig.name)
     _shutdown.set()
 
 
-# ─── Entry point ──────────────────────────────────────────────────────────────
+# ── Entry point ───────────────────────────────────────────────────────────────
 
 async def main() -> None:
     loop = asyncio.get_running_loop()
