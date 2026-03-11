@@ -2,10 +2,8 @@
 Authentication service — JWT + Telegram MTProto login flow.
 """
 import logging
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 
-from jose import JWTError, jwt
-from passlib.context import CryptContext
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 from telethon.errors import (
@@ -15,73 +13,70 @@ from telethon.errors import (
     SessionPasswordNeededError,
 )
 
-from app.config import settings
 from app.models import TelegramAccount, User
+from app.security import (
+    hash_password,
+    verify_password,
+    validate_phone,
+    validate_password_strength,
+)
 from app.telegram_client import build_client, decrypt_session, encrypt_session
 
 logger = logging.getLogger(__name__)
 
-pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
-
-# Pending clients aguardando verify-code (phone → client)
-# Em produção multi-processo, substitua por Redis
+# Pending clients aguardando verify-code
+# Em produção multi-processo substitua por Redis
 _pending_clients: dict[str, object] = {}
 
 
-# ─── Password ─────────────────────────────────────────────────────────────────
-
-def hash_password(plain: str) -> str:
-    return pwd_context.hash(plain)
-
-def verify_password(plain: str, hashed: str) -> bool:
-    return pwd_context.verify(plain, hashed)
-
-
-# ─── JWT ──────────────────────────────────────────────────────────────────────
-
-def create_access_token(user_id: str) -> str:
-    expire = datetime.now(timezone.utc) + timedelta(minutes=settings.access_token_expire_minutes)
-    return jwt.encode({"sub": user_id, "exp": expire}, settings.secret_key, algorithm="HS256")
-
-def decode_access_token(token: str) -> str | None:
-    try:
-        payload = jwt.decode(token, settings.secret_key, algorithms=["HS256"])
-        return payload["sub"]  # UUID string
-    except (JWTError, KeyError):
-        return None
-
-
-# ─── User CRUD ────────────────────────────────────────────────────────────────
+# ── User CRUD ─────────────────────────────────────────────────────────────────
 
 async def register_user(db: AsyncSession, email: str, password: str) -> User:
+    error = validate_password_strength(password)
+    if error:
+        raise ValueError(error)
     user = User(email=email, password_hash=hash_password(password))
     db.add(user)
     await db.flush()
+    logger.info("Novo usuário registrado: %s", email)
     return user
+
 
 async def authenticate_user(db: AsyncSession, email: str, password: str) -> User | None:
     result = await db.execute(select(User).where(User.email == email))
     user = result.scalar_one_or_none()
-    if user and verify_password(password, user.password_hash):
-        return user
-    return None
+    if not user:
+        # Timing attack mitigation — always hash even if user not found
+        hash_password("dummy_timing_protection")
+        logger.warning("Tentativa de login com e-mail inexistente: %s", email)
+        return None
+    if not verify_password(password, user.password_hash):
+        logger.warning("Senha incorreta para: %s", email)
+        return None
+    logger.info("Login bem-sucedido: %s", email)
+    return user
 
 
-# ─── Telegram MTProto login ───────────────────────────────────────────────────
+# ── Telegram MTProto ──────────────────────────────────────────────────────────
 
 async def send_login_code(phone_number: str) -> dict:
+    # Valida e normaliza o telefone antes de qualquer coisa
+    phone_number = validate_phone(phone_number)
+
     client = build_client()
     await client.connect()
     try:
         await client.send_code_request(phone_number)
         _pending_clients[phone_number] = client
-        logger.info("Código enviado para %s", phone_number)
+        logger.info("Código Telegram enviado para %s", phone_number)
         return {"detail": "Code sent successfully"}
     except FloodWaitError as e:
         await client.disconnect()
-        raise ValueError(f"Muitas tentativas. Aguarde {e.seconds} segundos.") from e
-    except Exception:
+        logger.warning("FloodWait ao enviar código para %s: %ds", phone_number, e.seconds)
+        raise ValueError(f"Muitas tentativas. Aguarde {e.seconds} segundos.")
+    except Exception as exc:
         await client.disconnect()
+        logger.error("Erro ao enviar código Telegram: %s", exc)
         raise
 
 
@@ -92,6 +87,8 @@ async def verify_login_code(
     code: str,
     password: str | None = None,
 ) -> TelegramAccount:
+    phone_number = validate_phone(phone_number)
+
     client = _pending_clients.get(phone_number)
     if client is None:
         raise ValueError("Nenhum login pendente para este número. Solicite o código primeiro.")
@@ -103,8 +100,10 @@ async def verify_login_code(
             raise ValueError("Autenticação em dois fatores ativa. Informe sua senha 2FA.")
         await client.sign_in(password=password)
     except PhoneCodeInvalidError:
+        logger.warning("Código inválido para %s", phone_number)
         raise ValueError("Código de verificação inválido.")
     except PhoneCodeExpiredError:
+        logger.warning("Código expirado para %s", phone_number)
         raise ValueError("Código expirado. Solicite um novo.")
     finally:
         _pending_clients.pop(phone_number, None)
@@ -112,6 +111,7 @@ async def verify_login_code(
     session_string = client.session.save()
     await client.disconnect()
 
+    # Criptografa antes de salvar — NUNCA armazena em texto puro
     encrypted = encrypt_session(session_string)
     now = datetime.now(timezone.utc)
 
@@ -150,6 +150,7 @@ async def get_active_account(db: AsyncSession, user_id: str) -> TelegramAccount 
 
 
 async def get_decrypted_session(db: AsyncSession, user_id: str) -> str | None:
+    """Descriptografa a sessão APENAS quando necessário — nunca exposta na API."""
     account = await get_active_account(db, user_id)
     if account:
         return decrypt_session(account.session_string_encrypted)
