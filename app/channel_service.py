@@ -1,52 +1,52 @@
+"""
+Channel discovery service.
+Suporta múltiplas contas via phone_number opcional.
+"""
 import logging
-from datetime import datetime, timezone
 
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 from telethon.tl.types import Channel as TgChannel
 
-from app.auth_service import get_decrypted_session
+from app.auth_service import get_decrypted_session_by_phone
 from app.models import Channel
 from app.telegram_client import get_client
 
 logger = logging.getLogger(__name__)
 
 
-async def sync_admin_channels(db: AsyncSession, user_id: int) -> list[Channel]:
-    session_string = await get_decrypted_session(db, user_id)
+async def sync_admin_channels(
+    db: AsyncSession,
+    user_id: str,
+    phone: str | None = None,
+) -> list[Channel]:
+    """
+    Sincroniza canais admin do Telegram para o usuário.
+    Se phone informado, usa a sessão daquele número específico.
+    """
+    session_string = await get_decrypted_session_by_phone(db, user_id, phone)
     if not session_string:
-        raise ValueError("No connected Telegram account.")
+        raise ValueError("Conta Telegram não encontrada. Conecte a conta primeiro.")
 
     admin_channels: list[dict] = []
 
     async with get_client(session_string) as client:
         async for dialog in client.iter_dialogs():
             entity = dialog.entity
-
-            # Aceita Channel e Supergrupo
             if not isinstance(entity, TgChannel):
                 continue
 
-            # Tenta verificar admin de várias formas
             is_admin = False
-
             try:
-                # Forma 1: creator direto
                 if getattr(entity, 'creator', False):
                     is_admin = True
-
-                # Forma 2: admin_rights no entity
                 elif getattr(entity, 'admin_rights', None) is not None:
                     is_admin = True
-
-                # Forma 3: get_permissions
                 else:
                     perms = await client.get_permissions(entity)
                     is_admin = getattr(perms, 'is_admin', False) or getattr(perms, 'is_creator', False)
-
             except Exception as exc:
                 logger.debug("Erro ao checar permissão do canal %s: %s", getattr(entity, 'title', entity.id), exc)
-                # Se não conseguiu checar, inclui mesmo assim se for creator
                 is_admin = getattr(entity, 'creator', False)
 
             if not is_admin:
@@ -58,12 +58,10 @@ async def sync_admin_channels(db: AsyncSession, user_id: int) -> list[Channel]:
                 "username": getattr(entity, "username", None),
                 "member_count": getattr(entity, "participants_count", 0) or 0,
             })
-
             logger.info("Canal admin encontrado: %s (id=%s)", entity.title, entity.id)
 
-    logger.info("Total de canais admin encontrados: %d", len(admin_channels))
+    logger.info("Total canais admin encontrados: %d para user %s phone %s", len(admin_channels), user_id, phone)
 
-    # Upsert no banco
     saved: list[Channel] = []
     for ch in admin_channels:
         result = await db.execute(
@@ -86,18 +84,18 @@ async def sync_admin_channels(db: AsyncSession, user_id: int) -> list[Channel]:
     return saved
 
 
-async def get_user_channels(db: AsyncSession, user_id: int) -> list[Channel]:
+async def get_user_channels(db: AsyncSession, user_id: str) -> list[Channel]:
     result = await db.execute(
         select(Channel).where(Channel.user_id == user_id).order_by(Channel.channel_name)
     )
     return list(result.scalars().all())
 
 
-async def get_channel_or_raise(db: AsyncSession, channel_id: int, user_id: int) -> Channel:
+async def get_channel_or_raise(db: AsyncSession, channel_id: str, user_id: str) -> Channel:
     result = await db.execute(
         select(Channel).where(Channel.id == channel_id, Channel.user_id == user_id)
     )
     channel = result.scalar_one_or_none()
     if not channel:
-        raise ValueError(f"Canal {channel_id} não encontrado.")
+        raise ValueError(f"Canal não encontrado ou sem permissão.")
     return channel

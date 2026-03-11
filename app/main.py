@@ -1,6 +1,6 @@
 """
-FastAPI application — Telegram Post Scheduler
-Segurança enterprise: rate limiting, security headers, RBAC, validação completa.
+FastAPI — Telegram Post Scheduler
+Suporte a múltiplas contas Telegram por usuário.
 """
 import logging
 import uuid
@@ -10,7 +10,6 @@ from typing import Annotated
 import boto3
 from fastapi import Depends, FastAPI, File, HTTPException, Request, UploadFile, status
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse
 from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm
 from pydantic import BaseModel, EmailStr, Field, field_validator
 from slowapi import Limiter, _rate_limit_exceeded_handler
@@ -21,7 +20,10 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.auth_service import (
     authenticate_user,
+    get_decrypted_session_by_phone,
+    list_telegram_accounts,
     register_user,
+    remove_telegram_account,
     send_login_code,
     verify_login_code,
 )
@@ -46,30 +48,26 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# ── Rate Limiter ──────────────────────────────────────────────────────────────
 limiter = Limiter(key_func=get_remote_address, default_limits=["200/minute"])
 
 app = FastAPI(
     title="Telegram Post Scheduler",
-    description="API segura para agendamento de posts no Telegram via MTProto.",
-    version="2.0.0",
-    docs_url="/docs" if not settings.is_production else None,  # desabilita docs em prod
+    version="2.1.0",
+    docs_url="/docs" if not settings.is_production else None,
     redoc_url=None,
 )
 
 app.state.limiter = limiter
 app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
 
-# ── CORS ──────────────────────────────────────────────────────────────────────
 app.add_middleware(
     CORSMiddleware,
     allow_origins=settings.origins_list,
     allow_credentials=True,
     allow_methods=["GET", "POST", "DELETE", "PUT"],
-    allow_headers=["Authorization", "Content-Type"],
+    allow_headers=["Authorization", "Content-Type", "X-Phone-Number"],
 )
 
-# ── Security Headers Middleware ───────────────────────────────────────────────
 @app.middleware("http")
 async def add_security_headers(request: Request, call_next):
     response = await call_next(request)
@@ -81,13 +79,15 @@ oauth2_scheme = OAuth2PasswordBearer(tokenUrl="/auth/login")
 
 
 # ── Startup ───────────────────────────────────────────────────────────────────
+
 @app.on_event("startup")
 async def startup() -> None:
     await init_db()
     logger.info("Banco de dados iniciado")
 
 
-# ── Auth dependency ───────────────────────────────────────────────────────────
+# ── Dependencies ──────────────────────────────────────────────────────────────
+
 async def current_user(
     token: Annotated[str, Depends(oauth2_scheme)],
     db: AsyncSession = Depends(get_db),
@@ -106,6 +106,11 @@ async def current_user(
     if not user:
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Usuário não encontrado")
     return user
+
+
+def get_active_phone(request: Request) -> str | None:
+    """Extrai o telefone da conta ativa do header X-Phone-Number."""
+    return request.headers.get("X-Phone-Number")
 
 
 # ── Schemas ───────────────────────────────────────────────────────────────────
@@ -151,6 +156,14 @@ class VerifyCodeRequest(BaseModel):
     @classmethod
     def validate_phone_number(cls, v):
         return validate_phone(v)
+
+
+class TelegramAccountOut(BaseModel):
+    id: str
+    phone_number: str
+    connected_at: datetime
+    last_used_at: datetime | None
+    model_config = {"from_attributes": True}
 
 
 class ChannelOut(BaseModel):
@@ -222,7 +235,6 @@ class AnalyticsOut(BaseModel):
 @app.post("/auth/register", response_model=TokenResponse, status_code=201, tags=["Auth"])
 @limiter.limit(settings.rate_limit_register)
 async def register(request: Request, body: RegisterRequest, db: AsyncSession = Depends(get_db)):
-    """Cadastro com validação de força de senha e rate limiting por IP."""
     try:
         user = await register_user(db, body.email, body.password)
         await db.commit()
@@ -248,7 +260,6 @@ async def login(
     form: Annotated[OAuth2PasswordRequestForm, Depends()],
     db: AsyncSession = Depends(get_db),
 ):
-    """Login com rate limiting — 5 tentativas por minuto por IP."""
     user = await authenticate_user(db, form.username, form.password)
     if not user:
         raise HTTPException(status_code=401, detail="E-mail ou senha inválidos")
@@ -260,7 +271,6 @@ async def login(
 
 @app.post("/auth/refresh", response_model=TokenResponse, tags=["Auth"])
 async def refresh_token(body: RefreshRequest):
-    """Renova o access token usando o refresh token."""
     user_id = decode_token(body.refresh_token, kind="refresh")
     if not user_id:
         raise HTTPException(status_code=401, detail="Refresh token inválido ou expirado.")
@@ -272,12 +282,33 @@ async def refresh_token(body: RefreshRequest):
 
 @app.post("/auth/logout", status_code=204, tags=["Auth"])
 async def logout(token: Annotated[str, Depends(oauth2_scheme)], user: User = Depends(current_user)):
-    """Invalida o token atual — adiciona à blacklist."""
     revoke_token(token)
     logger.info("Logout do usuário %s", user.id)
 
 
-# ── Telegram ──────────────────────────────────────────────────────────────────
+# ── Telegram Accounts ─────────────────────────────────────────────────────────
+
+@app.get("/telegram/accounts", response_model=list[TelegramAccountOut], tags=["Telegram"])
+async def list_accounts(
+    user: User = Depends(current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """Lista todas as contas Telegram conectadas do usuário."""
+    return await list_telegram_accounts(db, user.id)
+
+
+@app.delete("/telegram/accounts/{phone_number}", status_code=204, tags=["Telegram"])
+async def remove_account(
+    phone_number: str,
+    user: User = Depends(current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """Remove uma conta Telegram. Use o número no formato +5511999999999."""
+    try:
+        await remove_telegram_account(db, user.id, phone_number)
+    except ValueError as exc:
+        raise HTTPException(status_code=404, detail=str(exc))
+
 
 @app.post("/telegram/send-code", tags=["Telegram"])
 @limiter.limit(settings.rate_limit_send_code)
@@ -286,7 +317,6 @@ async def send_code(
     body: SendCodeRequest,
     user: User = Depends(current_user),
 ):
-    """Envia código SMS — máximo 3 tentativas por minuto por IP."""
     try:
         return await send_login_code(body.phone_number)
     except ValueError as exc:
@@ -313,11 +343,20 @@ async def verify_code(
 @app.get("/telegram/channels", response_model=list[ChannelOut], tags=["Channels"])
 async def list_channels(
     sync: bool = False,
+    phone: str | None = Depends(get_active_phone),
     user: User = Depends(current_user),
     db: AsyncSession = Depends(get_db),
 ):
+    """
+    Lista canais admin do usuário.
+    Passe o header X-Phone-Number para filtrar por conta específica.
+    Use ?sync=true para atualizar do Telegram em tempo real.
+    """
     try:
-        channels = await sync_admin_channels(db, user.id) if sync else await get_user_channels(db, user.id)
+        if sync:
+            channels = await sync_admin_channels(db, user.id, phone=phone)
+        else:
+            channels = await get_user_channels(db, user.id)
         return channels
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc))
@@ -353,7 +392,6 @@ async def list_posts(
     user: User = Depends(current_user),
     db: AsyncSession = Depends(get_db),
 ):
-    # Sempre filtra pelo user_id do token — nunca expõe dados de outros
     return await get_user_posts(db, user.id, status=status_filter)
 
 
@@ -406,10 +444,8 @@ async def upload_media(
         raise HTTPException(status_code=400, detail="Tipo não permitido. Use jpg, png, gif ou mp4.")
 
     contents = await file.read()
-
     if len(contents) > 50 * 1024 * 1024:
         raise HTTPException(status_code=400, detail="Arquivo muito grande. Máximo 50MB.")
-
     if not settings.r2_endpoint:
         raise HTTPException(status_code=500, detail="Serviço de upload não configurado.")
 
@@ -422,16 +458,8 @@ async def upload_media(
     )
 
     ext = file.filename.split(".")[-1].lower()
-    # Prefixo com UUID do usuário — isolamento no bucket
     key = f"{user.id}/{uuid.uuid4()}.{ext}"
-
-    s3.put_object(
-        Bucket=settings.r2_bucket,
-        Key=key,
-        Body=contents,
-        ContentType=file.content_type,
-    )
-
+    s3.put_object(Bucket=settings.r2_bucket, Key=key, Body=contents, ContentType=file.content_type)
     return {"url": f"{settings.r2_public_url}/{key}"}
 
 

@@ -24,8 +24,6 @@ from app.telegram_client import build_client, decrypt_session, encrypt_session
 
 logger = logging.getLogger(__name__)
 
-# Pending clients aguardando verify-code
-# Em produção multi-processo substitua por Redis
 _pending_clients: dict[str, object] = {}
 
 
@@ -46,9 +44,8 @@ async def authenticate_user(db: AsyncSession, email: str, password: str) -> User
     result = await db.execute(select(User).where(User.email == email))
     user = result.scalar_one_or_none()
     if not user:
-        # Timing attack mitigation — always hash even if user not found
         hash_password("dummy_timing_protection")
-        logger.warning("Tentativa de login com e-mail inexistente: %s", email)
+        logger.warning("Login com e-mail inexistente: %s", email)
         return None
     if not verify_password(password, user.password_hash):
         logger.warning("Senha incorreta para: %s", email)
@@ -60,9 +57,7 @@ async def authenticate_user(db: AsyncSession, email: str, password: str) -> User
 # ── Telegram MTProto ──────────────────────────────────────────────────────────
 
 async def send_login_code(phone_number: str) -> dict:
-    # Valida e normaliza o telefone antes de qualquer coisa
     phone_number = validate_phone(phone_number)
-
     client = build_client()
     await client.connect()
     try:
@@ -72,11 +67,11 @@ async def send_login_code(phone_number: str) -> dict:
         return {"detail": "Code sent successfully"}
     except FloodWaitError as e:
         await client.disconnect()
-        logger.warning("FloodWait ao enviar código para %s: %ds", phone_number, e.seconds)
+        logger.warning("FloodWait para %s: %ds", phone_number, e.seconds)
         raise ValueError(f"Muitas tentativas. Aguarde {e.seconds} segundos.")
     except Exception as exc:
         await client.disconnect()
-        logger.error("Erro ao enviar código Telegram: %s", exc)
+        logger.error("Erro ao enviar código: %s", exc)
         raise
 
 
@@ -88,7 +83,6 @@ async def verify_login_code(
     password: str | None = None,
 ) -> TelegramAccount:
     phone_number = validate_phone(phone_number)
-
     client = _pending_clients.get(phone_number)
     if client is None:
         raise ValueError("Nenhum login pendente para este número. Solicite o código primeiro.")
@@ -111,7 +105,6 @@ async def verify_login_code(
     session_string = client.session.save()
     await client.disconnect()
 
-    # Criptografa antes de salvar — NUNCA armazena em texto puro
     encrypted = encrypt_session(session_string)
     now = datetime.now(timezone.utc)
 
@@ -136,11 +129,12 @@ async def verify_login_code(
         db.add(account)
 
     await db.flush()
-    logger.info("Conta Telegram conectada para user %s", user_id)
+    logger.info("Conta Telegram conectada para user %s phone %s", user_id, phone_number)
     return account
 
 
 async def get_active_account(db: AsyncSession, user_id: str) -> TelegramAccount | None:
+    """Retorna a conta mais recentemente usada."""
     result = await db.execute(
         select(TelegramAccount)
         .where(TelegramAccount.user_id == user_id)
@@ -150,8 +144,71 @@ async def get_active_account(db: AsyncSession, user_id: str) -> TelegramAccount 
 
 
 async def get_decrypted_session(db: AsyncSession, user_id: str) -> str | None:
-    """Descriptografa a sessão APENAS quando necessário — nunca exposta na API."""
+    """Sessão da conta mais recente."""
     account = await get_active_account(db, user_id)
     if account:
         return decrypt_session(account.session_string_encrypted)
     return None
+
+
+async def get_decrypted_session_by_phone(
+    db: AsyncSession,
+    user_id: str,
+    phone_number: str | None = None,
+) -> str | None:
+    """
+    Retorna a sessão descriptografada de uma conta específica pelo telefone.
+    Se phone_number não informado, usa a mais recente.
+    """
+    if phone_number:
+        try:
+            phone_number = validate_phone(phone_number)
+        except ValueError:
+            pass
+        result = await db.execute(
+            select(TelegramAccount).where(
+                TelegramAccount.user_id == user_id,
+                TelegramAccount.phone_number == phone_number,
+            )
+        )
+        account = result.scalar_one_or_none()
+        if not account:
+            logger.warning("Sessão não encontrada para phone %s user %s", phone_number, user_id)
+            return None
+        return decrypt_session(account.session_string_encrypted)
+
+    return await get_decrypted_session(db, user_id)
+
+
+async def list_telegram_accounts(db: AsyncSession, user_id: str) -> list[TelegramAccount]:
+    """Lista todas as contas Telegram do usuário."""
+    result = await db.execute(
+        select(TelegramAccount)
+        .where(TelegramAccount.user_id == user_id)
+        .order_by(TelegramAccount.connected_at.desc())
+    )
+    return list(result.scalars().all())
+
+
+async def remove_telegram_account(db: AsyncSession, user_id: str, phone_number: str) -> None:
+    """Remove uma conta Telegram do usuário."""
+    from sqlalchemy import delete
+    try:
+        phone_number = validate_phone(phone_number)
+    except ValueError:
+        pass
+
+    result = await db.execute(
+        select(TelegramAccount).where(
+            TelegramAccount.user_id == user_id,
+            TelegramAccount.phone_number == phone_number,
+        )
+    )
+    account = result.scalar_one_or_none()
+    if not account:
+        raise ValueError("Conta não encontrada.")
+
+    await db.execute(
+        delete(TelegramAccount).where(TelegramAccount.id == account.id)
+    )
+    logger.info("Conta %s removida pelo usuário %s", phone_number, user_id)
