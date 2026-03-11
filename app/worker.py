@@ -89,14 +89,20 @@ async def scheduler_loop() -> None:
 
             if pending:
                 logger.info("Found %d post(s) to send", len(pending))
-                await asyncio.gather(*[send_post(p) for p in pending], return_exceptions=True)
+                results = await asyncio.gather(*[send_post(p) for p in pending], return_exceptions=True)
+                for r in results:
+                    if isinstance(r, Exception):
+                        logger.error("Erro ao enviar post: %s", r, exc_info=r)
         except Exception as exc:
-            logger.error("Scheduler error: %s", exc)
+            logger.error("Scheduler error: %s", exc, exc_info=True)
 
-        await asyncio.wait_for(
-            asyncio.shield(_shutdown.wait()),
-            timeout=settings.scheduler_interval_seconds,
-        )
+        try:
+            await asyncio.wait_for(
+                asyncio.shield(_shutdown.wait()),
+                timeout=settings.scheduler_interval_seconds,
+            )
+        except asyncio.TimeoutError:
+            pass
         # swallow TimeoutError – it just means we woke up normally
 
 
@@ -124,6 +130,8 @@ def _handle_signal(sig: signal.Signals) -> None:
 # ─── Entry point ──────────────────────────────────────────────────────────────
 
 async def main() -> None:
+    import traceback
+
     loop = asyncio.get_running_loop()
     for sig in (signal.SIGINT, signal.SIGTERM):
         loop.add_signal_handler(sig, _handle_signal, sig)
@@ -143,7 +151,11 @@ async def main() -> None:
 
     for task in done:
         if task.exception():
-            logger.error("Worker task failed: %s", task.exception())
+            logger.error(
+                "Worker task '%s' falhou:\n%s",
+                task.get_name(),
+                "".join(traceback.format_exception(task.exception()))
+            )
 
     logger.info("Worker stopped")
 
