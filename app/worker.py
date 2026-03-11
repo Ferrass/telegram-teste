@@ -11,10 +11,11 @@ Start with:
 import asyncio
 import logging
 import signal
-import sys
-from datetime import datetime, timezone
+import traceback
 
-from sqlalchemy import select, update
+import boto3
+from sqlalchemy import update
+from telethon.tl.types import PeerChannel
 
 from app.auth_service import get_decrypted_session
 from app.config import settings
@@ -23,7 +24,7 @@ from app.metrics_service import run_metrics_collection
 from app.models import PostStatus, ScheduledPost
 from app.post_service import get_pending_posts
 from app.telegram_client import get_client
-from telethon.tl.types import PeerChannel
+
 logging.basicConfig(
     level=settings.log_level,
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
@@ -33,14 +34,35 @@ logger = logging.getLogger(__name__)
 _shutdown = asyncio.Event()
 
 
-# ─── Scheduler loop ───────────────────────────────────────────────────────────
+# ─── R2 helper ────────────────────────────────────────────────────────────────
+
+def delete_from_r2(media_url: str) -> None:
+    """Remove um arquivo do Cloudflare R2 após o envio."""
+    if not settings.r2_endpoint or not media_url:
+        return
+    try:
+        s3 = boto3.client(
+            "s3",
+            endpoint_url=settings.r2_endpoint,
+            aws_access_key_id=settings.r2_access_key,
+            aws_secret_access_key=settings.r2_secret_key,
+            region_name="auto",
+        )
+        key = media_url.split("/")[-1]
+        s3.delete_object(Bucket=settings.r2_bucket, Key=key)
+        logger.info("Mídia apagada do R2: %s", key)
+    except Exception as exc:
+        logger.warning("Não foi possível apagar mídia do R2 (%s): %s", media_url, exc)
+
+
+# ─── Send post ────────────────────────────────────────────────────────────────
 
 async def send_post(post: ScheduledPost) -> None:
-    """Send a single scheduled post via the owner's Telethon session."""
+    """Envia um post agendado via sessão Telethon do dono."""
     async with AsyncSessionLocal() as db:
         session_string = await get_decrypted_session(db, post.user_id)
         if not session_string:
-            logger.error("No Telegram session for user %s – marking post %s as failed", post.user_id, post.id)
+            logger.error("Sem sessão Telegram para user %s — post %s marcado como failed", post.user_id, post.id)
             await db.execute(
                 update(ScheduledPost)
                 .where(ScheduledPost.id == post.id)
@@ -51,17 +73,28 @@ async def send_post(post: ScheduledPost) -> None:
 
         async with get_client(session_string) as client:
             try:
+                # Resolve o canal corretamente via PeerChannel
                 channel_id = post.channel.channel_id
                 if channel_id < 0:
-                    channel_id = int(str(abs(channel_id))[3:])  # remove o -100 do início
-                entity = await client.get_entity(PeerChannel(channel_id))
+                    channel_id = int(str(abs(channel_id))[3:])  # remove o -100
 
+                try:
+                    if post.channel.username:
+                        entity = await client.get_entity(f"@{post.channel.username}")
+                    else:
+                        entity = await client.get_entity(PeerChannel(channel_id))
+                except Exception:
+                    entity = await client.get_entity(post.channel.channel_id)
+
+                # Envia mensagem ou arquivo
                 if post.media_url:
                     sent = await client.send_file(entity, post.media_url, caption=post.message)
                 else:
                     sent = await client.send_message(entity, post.message)
 
                 msg_id = sent.id
+
+                # Atualiza status no banco
                 await db.execute(
                     update(ScheduledPost)
                     .where(ScheduledPost.id == post.id)
@@ -71,10 +104,14 @@ async def send_post(post: ScheduledPost) -> None:
                     )
                 )
                 await db.commit()
-                logger.info("Post %s sent to channel %s (msg_id=%s)", post.id, post.channel.channel_id, msg_id)
+                logger.info("Post %s enviado para canal %s (msg_id=%s)", post.id, post.channel.channel_id, msg_id)
+
+                # Apaga mídia do R2 após envio bem-sucedido
+                if post.media_url:
+                    delete_from_r2(post.media_url)
 
             except Exception as exc:
-                logger.error("Failed to send post %s: %s", post.id, exc)
+                logger.error("Falha ao enviar post %s: %s", post.id, exc, exc_info=True)
                 await db.execute(
                     update(ScheduledPost)
                     .where(ScheduledPost.id == post.id)
@@ -83,21 +120,23 @@ async def send_post(post: ScheduledPost) -> None:
                 await db.commit()
 
 
+# ─── Scheduler loop ───────────────────────────────────────────────────────────
+
 async def scheduler_loop() -> None:
-    logger.info("Scheduler worker started (interval=%ds)", settings.scheduler_interval_seconds)
+    logger.info("Scheduler worker iniciado (intervalo=%ds)", settings.scheduler_interval_seconds)
     while not _shutdown.is_set():
         try:
             async with AsyncSessionLocal() as db:
                 pending = await get_pending_posts(db)
 
             if pending:
-                logger.info("Found %d post(s) to send", len(pending))
+                logger.info("Encontrados %d post(s) para enviar", len(pending))
                 results = await asyncio.gather(*[send_post(p) for p in pending], return_exceptions=True)
                 for r in results:
                     if isinstance(r, Exception):
                         logger.error("Erro ao enviar post: %s", r, exc_info=r)
         except Exception as exc:
-            logger.error("Scheduler error: %s", exc, exc_info=True)
+            logger.error("Erro no scheduler: %s", exc, exc_info=True)
 
         try:
             await asyncio.wait_for(
@@ -106,35 +145,37 @@ async def scheduler_loop() -> None:
             )
         except asyncio.TimeoutError:
             pass
-        # swallow TimeoutError – it just means we woke up normally
 
+
+# ─── Metrics loop ─────────────────────────────────────────────────────────────
 
 async def metrics_loop() -> None:
-    logger.info("Metrics worker started (interval=%ds)", settings.metrics_interval_seconds)
+    logger.info("Metrics worker iniciado (intervalo=%ds)", settings.metrics_interval_seconds)
     while not _shutdown.is_set():
         try:
             await run_metrics_collection()
         except Exception as exc:
-            logger.error("Metrics collection error: %s", exc)
+            logger.error("Erro na coleta de métricas: %s", exc, exc_info=True)
 
-        await asyncio.wait_for(
-            asyncio.shield(_shutdown.wait()),
-            timeout=settings.metrics_interval_seconds,
-        )
+        try:
+            await asyncio.wait_for(
+                asyncio.shield(_shutdown.wait()),
+                timeout=settings.metrics_interval_seconds,
+            )
+        except asyncio.TimeoutError:
+            pass
 
 
 # ─── Graceful shutdown ────────────────────────────────────────────────────────
 
 def _handle_signal(sig: signal.Signals) -> None:
-    logger.info("Received %s – shutting down…", sig.name)
+    logger.info("Sinal recebido %s — encerrando...", sig.name)
     _shutdown.set()
 
 
 # ─── Entry point ──────────────────────────────────────────────────────────────
 
 async def main() -> None:
-    import traceback
-
     loop = asyncio.get_running_loop()
     for sig in (signal.SIGINT, signal.SIGTERM):
         loop.add_signal_handler(sig, _handle_signal, sig)
@@ -160,7 +201,7 @@ async def main() -> None:
                 "".join(traceback.format_exception(task.exception()))
             )
 
-    logger.info("Worker stopped")
+    logger.info("Worker encerrado")
 
 
 if __name__ == "__main__":
