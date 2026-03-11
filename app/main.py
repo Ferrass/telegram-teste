@@ -2,20 +2,22 @@
 FastAPI application — Telegram Post Scheduler
 """
 import logging
+import uuid
 from datetime import datetime
 from typing import Annotated
 
-from fastapi import Depends, FastAPI, HTTPException, status, UploadFile, File
+import boto3
+from fastapi import Depends, FastAPI, File, HTTPException, UploadFile, status
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm
 from pydantic import BaseModel, EmailStr
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.auth_service import (
     authenticate_user,
     create_access_token,
     decode_access_token,
-    get_decrypted_session,
     register_user,
     send_login_code,
     verify_login_code,
@@ -23,28 +25,25 @@ from app.auth_service import (
 from app.channel_service import get_user_channels, sync_admin_channels
 from app.config import settings
 from app.database import get_db, init_db
-from app.models import PostStatus, ScheduledPost, User
+from app.models import PostStatus, User
 from app.post_service import (
     cancel_post,
     get_user_posts,
     schedule_post,
 )
 
-import boto3
-import uuid
-
 logging.basicConfig(level=settings.log_level, format="%(asctime)s [%(levelname)s] %(name)s: %(message)s")
 logger = logging.getLogger(__name__)
 
 app = FastAPI(
     title="Telegram Post Scheduler",
-    description="Schedule and analyse posts to Telegram channels via MTProto.",
+    description="Agende e analise posts em canais Telegram via MTProto.",
     version="1.0.0",
 )
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # tighten in production
+    allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -58,7 +57,7 @@ oauth2_scheme = OAuth2PasswordBearer(tokenUrl="/auth/login")
 @app.on_event("startup")
 async def startup() -> None:
     await init_db()
-    logger.info("Database initialised")
+    logger.info("Banco de dados iniciado")
 
 
 # ─── Auth dependency ──────────────────────────────────────────────────────────
@@ -69,16 +68,16 @@ async def current_user(
 ) -> User:
     user_id = decode_access_token(token)
     if not user_id:
-        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid or expired token")
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Token inválido ou expirado")
     from sqlalchemy import select
     result = await db.execute(select(User).where(User.id == user_id))
     user = result.scalar_one_or_none()
     if not user:
-        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="User not found")
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Usuário não encontrado")
     return user
 
 
-# ─── Pydantic schemas ─────────────────────────────────────────────────────────
+# ─── Schemas ──────────────────────────────────────────────────────────────────
 
 class RegisterRequest(BaseModel):
     email: EmailStr
@@ -94,26 +93,25 @@ class SendCodeRequest(BaseModel):
 class VerifyCodeRequest(BaseModel):
     phone_number: str
     code: str
-    password: str | None = None  # 2FA password
+    password: str | None = None
 
 class ChannelOut(BaseModel):
-    id: int
+    id: str
     channel_id: int
     channel_name: str
     username: str | None
     member_count: int
-
     model_config = {"from_attributes": True}
 
 class SchedulePostRequest(BaseModel):
-    channel_id: int
+    channel_id: str
     message: str
     media_url: str | None = None
     scheduled_time: datetime
 
 class PostOut(BaseModel):
-    id: int
-    channel_id: int
+    id: str
+    channel_id: str
     message: str
     media_url: str | None
     scheduled_time: datetime
@@ -122,11 +120,10 @@ class PostOut(BaseModel):
     views: int
     forwards: int
     created_at: datetime
-
     model_config = {"from_attributes": True}
 
 class AnalyticsOut(BaseModel):
-    post_id: int
+    post_id: str
     channel_name: str
     message: str
     scheduled_time: datetime
@@ -134,7 +131,6 @@ class AnalyticsOut(BaseModel):
     views: int
     forwards: int
     telegram_message_id: int | None
-
     model_config = {"from_attributes": True}
 
 
@@ -142,19 +138,17 @@ class AnalyticsOut(BaseModel):
 # Routes
 # ═══════════════════════════════════════════════════════════════════════════════
 
-# ─── User Auth ────────────────────────────────────────────────────────────────
+# ─── Auth ─────────────────────────────────────────────────────────────────────
 
-@app.post("/auth/register", response_model=TokenResponse, status_code=status.HTTP_201_CREATED, tags=["Auth"])
+@app.post("/auth/register", response_model=TokenResponse, status_code=201, tags=["Auth"])
 async def register(body: RegisterRequest, db: AsyncSession = Depends(get_db)):
-    from sqlalchemy.exc import IntegrityError
     try:
         user = await register_user(db, body.email, body.password)
         await db.commit()
-        token = create_access_token(user.id)
-        return TokenResponse(access_token=token)
+        return TokenResponse(access_token=create_access_token(user.id))
     except IntegrityError:
         await db.rollback()
-        raise HTTPException(status_code=409, detail="Email already registered.")
+        raise HTTPException(status_code=409, detail="E-mail já cadastrado.")
     except Exception as e:
         await db.rollback()
         raise HTTPException(status_code=500, detail=str(e))
@@ -162,21 +156,16 @@ async def register(body: RegisterRequest, db: AsyncSession = Depends(get_db)):
 
 @app.post("/auth/login", response_model=TokenResponse, tags=["Auth"])
 async def login(form: Annotated[OAuth2PasswordRequestForm, Depends()], db: AsyncSession = Depends(get_db)):
-    """Log in with email + password (OAuth2 password flow)."""
     user = await authenticate_user(db, form.username, form.password)
     if not user:
-        raise HTTPException(status_code=401, detail="Invalid credentials")
+        raise HTTPException(status_code=401, detail="E-mail ou senha inválidos")
     return TokenResponse(access_token=create_access_token(user.id))
 
 
-# ─── Telegram Auth ────────────────────────────────────────────────────────────
+# ─── Telegram ─────────────────────────────────────────────────────────────────
 
 @app.post("/telegram/send-code", tags=["Telegram"])
-async def send_code(
-    body: SendCodeRequest,
-    user: User = Depends(current_user),
-):
-    """Step 1 of Telegram login: request an SMS/app code."""
+async def send_code(body: SendCodeRequest, user: User = Depends(current_user)):
     try:
         return await send_login_code(body.phone_number)
     except ValueError as exc:
@@ -189,10 +178,9 @@ async def verify_code(
     user: User = Depends(current_user),
     db: AsyncSession = Depends(get_db),
 ):
-    """Step 2 of Telegram login: submit the verification code."""
     try:
         account = await verify_login_code(db, user.id, body.phone_number, body.code, body.password)
-        return {"detail": "Telegram account connected", "phone": account.phone_number}
+        return {"detail": "Conta Telegram conectada", "phone": account.phone_number}
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc))
 
@@ -205,10 +193,6 @@ async def list_channels(
     user: User = Depends(current_user),
     db: AsyncSession = Depends(get_db),
 ):
-    """
-    Return channels where the user is admin.
-    Pass ?sync=true to refresh from Telegram (slower but always up-to-date).
-    """
     try:
         if sync:
             channels = await sync_admin_channels(db, user.id)
@@ -227,7 +211,6 @@ async def create_post(
     user: User = Depends(current_user),
     db: AsyncSession = Depends(get_db),
 ):
-    """Schedule a new post."""
     try:
         post = await schedule_post(
             db,
@@ -248,17 +231,16 @@ async def list_posts(
     user: User = Depends(current_user),
     db: AsyncSession = Depends(get_db),
 ):
-    """List all posts for the authenticated user."""
+    # Filtra SEMPRE pelo user_id do token — nunca expõe dados de outros usuários
     return await get_user_posts(db, user.id, status=status_filter)
 
 
 @app.delete("/posts/{post_id}", status_code=204, tags=["Posts"])
 async def delete_post(
-    post_id: int,
+    post_id: str,
     user: User = Depends(current_user),
     db: AsyncSession = Depends(get_db),
 ):
-    """Cancel a scheduled post (sets status to 'cancelled')."""
     try:
         await cancel_post(db, post_id, user.id)
     except ValueError as exc:
@@ -272,7 +254,7 @@ async def analytics(
     user: User = Depends(current_user),
     db: AsyncSession = Depends(get_db),
 ):
-    """Return sent posts with their latest view/forward metrics."""
+    # Filtra SEMPRE pelo user_id do token
     posts = await get_user_posts(db, user.id, status=PostStatus.sent)
     return [
         AnalyticsOut(
@@ -288,7 +270,8 @@ async def analytics(
         for p in posts
     ]
 
-# ─── Upload Image ───────────────────────────────────────────────────────────────────
+
+# ─── Media Upload ─────────────────────────────────────────────────────────────
 
 @app.post("/media/upload", tags=["Media"])
 async def upload_media(
@@ -297,7 +280,7 @@ async def upload_media(
 ):
     allowed = ["image/jpeg", "image/png", "image/gif", "video/mp4"]
     if file.content_type not in allowed:
-        raise HTTPException(status_code=400, detail="Tipo de arquivo não permitido. Use jpg, png, gif ou mp4.")
+        raise HTTPException(status_code=400, detail="Tipo não permitido. Use jpg, png, gif ou mp4.")
 
     contents = await file.read()
 
@@ -316,7 +299,8 @@ async def upload_media(
     )
 
     ext = file.filename.split(".")[-1].lower()
-    key = f"{uuid.uuid4()}.{ext}"
+    # Usa UUID do usuário como prefixo — garante isolamento por usuário no bucket
+    key = f"{user.id}/{uuid.uuid4()}.{ext}"
 
     s3.put_object(
         Bucket=settings.r2_bucket,
@@ -327,6 +311,7 @@ async def upload_media(
 
     url = f"{settings.r2_public_url}/{key}"
     return {"url": url}
+
 
 # ─── Health ───────────────────────────────────────────────────────────────────
 

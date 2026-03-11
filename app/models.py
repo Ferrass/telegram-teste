@@ -1,7 +1,8 @@
 """
-SQLAlchemy ORM models for the Telegram scheduler platform.
+SQLAlchemy ORM models com UUID como chave primária.
 """
 import enum
+import uuid
 from datetime import datetime, timezone
 
 from sqlalchemy import (
@@ -14,6 +15,7 @@ from sqlalchemy import (
     Text,
     func,
 )
+from sqlalchemy.dialects.postgresql import UUID
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.database import Base
@@ -21,6 +23,9 @@ from app.database import Base
 
 def utcnow() -> datetime:
     return datetime.now(timezone.utc)
+
+def new_uuid() -> str:
+    return str(uuid.uuid4())
 
 
 # ─── Enums ────────────────────────────────────────────────────────────────────
@@ -37,7 +42,7 @@ class PostStatus(str, enum.Enum):
 class User(Base):
     __tablename__ = "users"
 
-    id: Mapped[int] = mapped_column(Integer, primary_key=True, index=True)
+    id: Mapped[str] = mapped_column(UUID(as_uuid=False), primary_key=True, default=new_uuid, index=True)
     email: Mapped[str] = mapped_column(String(255), unique=True, nullable=False, index=True)
     password_hash: Mapped[str] = mapped_column(String(255), nullable=False)
     created_at: Mapped[datetime] = mapped_column(
@@ -58,10 +63,9 @@ class User(Base):
 class TelegramAccount(Base):
     __tablename__ = "telegram_accounts"
 
-    id: Mapped[int] = mapped_column(Integer, primary_key=True, index=True)
-    user_id: Mapped[int] = mapped_column(Integer, ForeignKey("users.id", ondelete="CASCADE"), nullable=False)
+    id: Mapped[str] = mapped_column(UUID(as_uuid=False), primary_key=True, default=new_uuid, index=True)
+    user_id: Mapped[str] = mapped_column(UUID(as_uuid=False), ForeignKey("users.id", ondelete="CASCADE"), nullable=False)
     phone_number: Mapped[str] = mapped_column(String(20), nullable=False)
-    # AES-256 encrypted Telethon StringSession
     session_string_encrypted: Mapped[str] = mapped_column(Text, nullable=False)
     connected_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=utcnow, server_default=func.now()
@@ -74,8 +78,8 @@ class TelegramAccount(Base):
 class Channel(Base):
     __tablename__ = "channels"
 
-    id: Mapped[int] = mapped_column(Integer, primary_key=True, index=True)
-    user_id: Mapped[int] = mapped_column(Integer, ForeignKey("users.id", ondelete="CASCADE"), nullable=False)
+    id: Mapped[str] = mapped_column(UUID(as_uuid=False), primary_key=True, default=new_uuid, index=True)
+    user_id: Mapped[str] = mapped_column(UUID(as_uuid=False), ForeignKey("users.id", ondelete="CASCADE"), nullable=False)
     channel_id: Mapped[int] = mapped_column(BigInteger, nullable=False)
     channel_name: Mapped[str] = mapped_column(String(255), nullable=False)
     username: Mapped[str | None] = mapped_column(String(255), nullable=True)
@@ -90,9 +94,9 @@ class Channel(Base):
 class ScheduledPost(Base):
     __tablename__ = "scheduled_posts"
 
-    id: Mapped[int] = mapped_column(Integer, primary_key=True, index=True)
-    user_id: Mapped[int] = mapped_column(Integer, ForeignKey("users.id", ondelete="CASCADE"), nullable=False)
-    channel_id: Mapped[int] = mapped_column(Integer, ForeignKey("channels.id", ondelete="CASCADE"), nullable=False)
+    id: Mapped[str] = mapped_column(UUID(as_uuid=False), primary_key=True, default=new_uuid, index=True)
+    user_id: Mapped[str] = mapped_column(UUID(as_uuid=False), ForeignKey("users.id", ondelete="CASCADE"), nullable=False)
+    channel_id: Mapped[str] = mapped_column(UUID(as_uuid=False), ForeignKey("channels.id", ondelete="CASCADE"), nullable=False)
     message: Mapped[str] = mapped_column(Text, nullable=False)
     media_url: Mapped[str | None] = mapped_column(String(2048), nullable=True)
     scheduled_time: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, index=True)
@@ -116,8 +120,8 @@ class ScheduledPost(Base):
 class PostMetricsHistory(Base):
     __tablename__ = "post_metrics_history"
 
-    id: Mapped[int] = mapped_column(Integer, primary_key=True, index=True)
-    post_id: Mapped[int] = mapped_column(Integer, ForeignKey("scheduled_posts.id", ondelete="CASCADE"), nullable=False)
+    id: Mapped[str] = mapped_column(UUID(as_uuid=False), primary_key=True, default=new_uuid, index=True)
+    post_id: Mapped[str] = mapped_column(UUID(as_uuid=False), ForeignKey("scheduled_posts.id", ondelete="CASCADE"), nullable=False)
     views: Mapped[int] = mapped_column(Integer, default=0)
     forwards: Mapped[int] = mapped_column(Integer, default=0)
     captured_at: Mapped[datetime] = mapped_column(
