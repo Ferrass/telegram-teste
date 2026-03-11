@@ -145,13 +145,18 @@ class AnalyticsOut(BaseModel):
 
 @app.post("/auth/register", response_model=TokenResponse, status_code=status.HTTP_201_CREATED, tags=["Auth"])
 async def register(body: RegisterRequest, db: AsyncSession = Depends(get_db)):
-    """Register a new platform user."""
+    from sqlalchemy.exc import IntegrityError
     try:
         user = await register_user(db, body.email, body.password)
+        await db.commit()
         token = create_access_token(user.id)
         return TokenResponse(access_token=token)
-    except Exception:
+    except IntegrityError:
+        await db.rollback()
         raise HTTPException(status_code=409, detail="Email already registered.")
+    except Exception as e:
+        await db.rollback()
+        raise HTTPException(status_code=500, detail=str(e))
 
 
 @app.post("/auth/login", response_model=TokenResponse, tags=["Auth"])
