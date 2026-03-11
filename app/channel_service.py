@@ -1,6 +1,7 @@
 """
 Channel discovery service.
 Suporta múltiplas contas via phone_number opcional.
+Salva e filtra canais pelo número de telefone da conta.
 """
 import logging
 
@@ -21,8 +22,8 @@ async def sync_admin_channels(
     phone: str | None = None,
 ) -> list[Channel]:
     """
-    Sincroniza canais admin do Telegram para o usuário.
-    Se phone informado, usa a sessão daquele número específico.
+    Sincroniza canais admin do Telegram.
+    Salva o phone_number junto ao canal para controle por conta.
     """
     session_string = await get_decrypted_session_by_phone(db, user_id, phone)
     if not session_string:
@@ -57,10 +58,11 @@ async def sync_admin_channels(
                 "channel_name": entity.title,
                 "username": getattr(entity, "username", None),
                 "member_count": getattr(entity, "participants_count", 0) or 0,
+                "phone_number": phone,  # vincula o canal ao número da conta
             })
-            logger.info("Canal admin encontrado: %s (id=%s)", entity.title, entity.id)
+            logger.info("Canal admin encontrado: %s (id=%s phone=%s)", entity.title, entity.id, phone)
 
-    logger.info("Total canais admin encontrados: %d para user %s phone %s", len(admin_channels), user_id, phone)
+    logger.info("Total: %d canais para user=%s phone=%s", len(admin_channels), user_id, phone)
 
     saved: list[Channel] = []
     for ch in admin_channels:
@@ -75,6 +77,7 @@ async def sync_admin_channels(
             channel.channel_name = ch["channel_name"]
             channel.username = ch["username"]
             channel.member_count = ch["member_count"]
+            channel.phone_number = ch["phone_number"]
         else:
             channel = Channel(user_id=user_id, **ch)
             db.add(channel)
@@ -84,10 +87,23 @@ async def sync_admin_channels(
     return saved
 
 
-async def get_user_channels(db: AsyncSession, user_id: str) -> list[Channel]:
-    result = await db.execute(
-        select(Channel).where(Channel.user_id == user_id).order_by(Channel.channel_name)
-    )
+async def get_user_channels(
+    db: AsyncSession,
+    user_id: str,
+    phone: str | None = None,
+) -> list[Channel]:
+    """
+    Lista canais do usuário.
+    Se phone informado, retorna só os canais daquele número.
+    Se não informado, retorna todos os canais do usuário.
+    """
+    query = select(Channel).where(Channel.user_id == user_id)
+
+    if phone:
+        query = query.where(Channel.phone_number == phone)
+
+    query = query.order_by(Channel.channel_name)
+    result = await db.execute(query)
     return list(result.scalars().all())
 
 
@@ -97,5 +113,5 @@ async def get_channel_or_raise(db: AsyncSession, channel_id: str, user_id: str) 
     )
     channel = result.scalar_one_or_none()
     if not channel:
-        raise ValueError(f"Canal não encontrado ou sem permissão.")
+        raise ValueError("Canal não encontrado ou sem permissão.")
     return channel

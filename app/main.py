@@ -172,6 +172,7 @@ class ChannelOut(BaseModel):
     channel_name: str
     username: str | None
     member_count: int
+    phone_number: str | None
     model_config = {"from_attributes": True}
 
 
@@ -356,7 +357,7 @@ async def list_channels(
         if sync:
             channels = await sync_admin_channels(db, user.id, phone=phone)
         else:
-            channels = await get_user_channels(db, user.id)
+            channels = await get_user_channels(db, user.id, phone=phone)
         return channels
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc))

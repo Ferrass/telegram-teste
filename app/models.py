@@ -28,16 +28,12 @@ def new_uuid() -> str:
     return str(uuid.uuid4())
 
 
-# ─── Enums ────────────────────────────────────────────────────────────────────
-
 class PostStatus(str, enum.Enum):
     scheduled = "scheduled"
     sent = "sent"
     failed = "failed"
     cancelled = "cancelled"
 
-
-# ─── Models ───────────────────────────────────────────────────────────────────
 
 class User(Base):
     __tablename__ = "users"
@@ -80,6 +76,7 @@ class Channel(Base):
 
     id: Mapped[str] = mapped_column(UUID(as_uuid=False), primary_key=True, default=new_uuid, index=True)
     user_id: Mapped[str] = mapped_column(UUID(as_uuid=False), ForeignKey("users.id", ondelete="CASCADE"), nullable=False)
+    phone_number: Mapped[str | None] = mapped_column(String(20), nullable=True, index=True)
     channel_id: Mapped[int] = mapped_column(BigInteger, nullable=False)
     channel_name: Mapped[str] = mapped_column(String(255), nullable=False)
     username: Mapped[str | None] = mapped_column(String(255), nullable=True)
