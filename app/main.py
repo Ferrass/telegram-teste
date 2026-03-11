@@ -5,7 +5,7 @@ import logging
 from datetime import datetime
 from typing import Annotated
 
-from fastapi import Depends, FastAPI, HTTPException, status
+from fastapi import Depends, FastAPI, HTTPException, status, UploadFile, File
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm
 from pydantic import BaseModel, EmailStr
@@ -30,7 +30,8 @@ from app.post_service import (
     schedule_post,
 )
 
-
+import boto3
+import uuid
 
 logging.basicConfig(level=settings.log_level, format="%(asctime)s [%(levelname)s] %(name)s: %(message)s")
 logger = logging.getLogger(__name__)
@@ -287,6 +288,45 @@ async def analytics(
         for p in posts
     ]
 
+# ─── Upload Image ───────────────────────────────────────────────────────────────────
+
+@app.post("/media/upload", tags=["Media"])
+async def upload_media(
+    file: UploadFile = File(...),
+    user: User = Depends(current_user),
+):
+    allowed = ["image/jpeg", "image/png", "image/gif", "video/mp4"]
+    if file.content_type not in allowed:
+        raise HTTPException(status_code=400, detail="Tipo de arquivo não permitido. Use jpg, png, gif ou mp4.")
+
+    contents = await file.read()
+
+    if len(contents) > 50 * 1024 * 1024:
+        raise HTTPException(status_code=400, detail="Arquivo muito grande. Máximo 50MB.")
+
+    if not settings.r2_endpoint:
+        raise HTTPException(status_code=500, detail="Serviço de upload não configurado.")
+
+    s3 = boto3.client(
+        "s3",
+        endpoint_url=settings.r2_endpoint,
+        aws_access_key_id=settings.r2_access_key,
+        aws_secret_access_key=settings.r2_secret_key,
+        region_name="auto",
+    )
+
+    ext = file.filename.split(".")[-1].lower()
+    key = f"{uuid.uuid4()}.{ext}"
+
+    s3.put_object(
+        Bucket=settings.r2_bucket,
+        Key=key,
+        Body=contents,
+        ContentType=file.content_type,
+    )
+
+    url = f"{settings.r2_public_url}/{key}"
+    return {"url": url}
 
 # ─── Health ───────────────────────────────────────────────────────────────────
 
